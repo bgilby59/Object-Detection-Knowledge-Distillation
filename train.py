@@ -1,3 +1,4 @@
+from data.coco import *
 from data import *
 import torch
 from torch import nn
@@ -10,10 +11,13 @@ import argparse
 import os
 import time
 
+# new imports
+import torchvision
+
 parser = argparse.ArgumentParser(
     description='VGG-Distillation-Mobilenetv2')
 train_set = parser.add_mutually_exclusive_group()
-parser.add_argument('--dataset_root', default=VOC_ROOT,
+parser.add_argument('--dataset_root', default='/main/dev/data/external/COCO2017',
                     help='Path of training set')
 parser.add_argument('--prepare_teacher_model', action='store_true',
                     help='fine tune vgg-ssd with less prior boxes')
@@ -40,19 +44,60 @@ parser.add_argument('--local_rank', default=0, type=int,
         'or automatically set by using \'python -m multiproc\'.')
 args = parser.parse_args()
 
+# *NEW* function
+def process_coco_annotations(annotations, im_width, im_height):
+    targets = []
+    if False:#batch_size > 1:
+        for annotation in (annotations):
+            objects = []
+            for i, obj_ann in enumerate(annotation):
+                print(obj_ann)
+                print(type(obj_ann))
+                print(obj_ann['bbox'][0])
+                # bbox in ann from [x1, y1, width, height] -> [x1, y1, x2, y2]
+                bbox = [obj_ann['bbox'][0]/im_width, obj_ann['bbox'][1]/im_height, (obj_ann['bbox'][0] + obj_ann['bbox'][2])/im_width, (obj_ann['bbox'][1] + obj_ann['bbox'][3])/im_height]
+                obj_id = obj_ann['category_id']
+                obj_ann_formatted = bbox + [obj_id]
+                to_floats = [tensor.item() for tensor in obj_ann_formatted]
+
+                objects.append(to_floats)
+            targets.append(objects)
+    
+    else:
+        annotation=annotations
+        objects = []
+        for i, obj_ann in enumerate(annotation):
+            #print(obj_ann)
+            #print(type(obj_ann))
+            #print(obj_ann['bbox'][0])
+            # bbox in ann from [x1, y1, width, height] -> [x1, y1, x2, y2]
+            bbox = [obj_ann['bbox'][0]/im_width, obj_ann['bbox'][1]/im_height, (obj_ann['bbox'][0] + obj_ann['bbox'][2])/im_width, (obj_ann['bbox'][1] + obj_ann['bbox'][3])/im_height]
+            obj_id = obj_ann['category_id']
+            obj_ann_formatted = bbox + [obj_id]
+            to_floats = [tensor.item() for tensor in obj_ann_formatted]
+
+            objects.append(obj_ann_formatted)
+        targets.append(objects)
+
+    return torch.Tensor(targets)
+
 def train_one_epoch(loader, getloss, optimizer, epoch):
     loss_amount = 0
-    t0 = time.clock()
+    t0 = time.perf_counter()
     # load train data
     for iteration, batch in enumerate(loader):
-        images, targets = batch
+        images, targets = batch # each target is an annotation for an image
+        #images, annotations = batch
+        #print(images.size())
+        #(_, _, im_height, im_width) = images.size()
+        #targets = process_coco_annotations(annotations, im_height, im_width)
         images = images.cuda()
         # forward
         optimizer.zero_grad()
         loss, loss_bare = getloss(images.div(128.), targets)
         loss.backward()
         optimizer.step()
-        t1 = time.clock()
+        t1 = time.perf_counter()
         loss_amount += loss_bare.item()
         if iteration % 10 == 0 and not iteration == 0 and not args.local_rank:
             print('Loss: %.6f | iter: %03d | timer: %.4f sec. | epoch: %d' %
@@ -76,7 +121,7 @@ def train():
 
     target = ''
     if args.prepare_teacher_model or not args.teacher_model:
-        vgg_ = create_vgg('train')
+        vgg_ = create_vgg('train', num_classes=coco_conf['num_classes'])
         if not args.resume:
             if not os.path.exists('models/ssd300_mAP_77.43_v2.pth'):
                 print('Imagenet pretrained vgg model is not exist in models/, please follow the instruction in README.md')
@@ -90,12 +135,12 @@ def train():
         optimizer = optim.SGD(vgg_.parameters(), lr=args.lr, momentum=0.9,
                     weight_decay=5e-4)
         if _distributed:
-            getloss = nn.parallel.DistributedDataParallel(NetwithLoss(voc, vgg_).cuda(), device_ids=[args.local_rank], find_unused_parameters=True)
+            getloss = nn.parallel.DistributedDataParallel(NetwithLoss(coco_conf, vgg_).cuda(), device_ids=[args.local_rank], find_unused_parameters=True)
         else:
-            getloss = NetwithLoss(voc, vgg_).cuda()
+            getloss = NetwithLoss(coco_conf, vgg_).cuda()
         target = 'teacher_vgg'
     else:
-        vgg_ = create_vgg('train')
+        vgg_ = create_vgg('train', num_classes=coco_conf['num_classes'])
         missing, unexpected = vgg_.load_state_dict({k.replace('module.',''):v 
         for k,v in torch.load(args.teacher_model, map_location='cpu').items()}, strict=False)
         vgg_.eval()
@@ -114,9 +159,9 @@ def train():
         #             weight_decay=5e-4)
         optimizer = optim.Adam(mobilenetv2_.parameters(), lr=args.lr)
         if _distributed:
-            getloss = nn.parallel.DistributedDataParallel(NetwithLoss(voc, vgg_, mobilenetv2_).cuda(), device_ids=[args.local_rank], find_unused_parameters=True)
+            getloss = nn.parallel.DistributedDataParallel(NetwithLoss(coco_conf, vgg_, mobilenetv2_).cuda(), device_ids=[args.local_rank], find_unused_parameters=True)
         else:
-            getloss = NetwithLoss(voc, vgg_, mobilenetv2_).cuda()
+            getloss = NetwithLoss(coco_conf, vgg_, mobilenetv2_).cuda()
         target = 'student_mbv2'
 
     for param_group in optimizer.param_groups:
@@ -127,23 +172,17 @@ def train():
     if not args.local_rank:
         print('Task: ', target)
         print('Loading the dataset...', end='')
-    dataset = VOCDetection(root=args.dataset_root,
-                           transform=SSDAugmentation(voc['min_dim'],
-                                                     MEANS))
+    #dataset = COCODetection('/main/dev/data/external/COCO2017/train2017', '/main/dev/data/external/COCO2017/annotations/instances_train2017.json',SSDTransformer(dboxes, (300, 300), val=True))
+    #dataset = torchvision.datasets.CocoDetection('/main/dev/data/external/COCO2017/val2017', '/main/dev/data/external/COCO2017/annotations/instances_val2017.json', transform=SSDAugmentation(coco['min_dim'], MEANS))
+    dataset = COCODetection(root='/main/dev/data/external/COCO2017/', image_set='train2017', transform=SSDAugmentation(coco_conf['min_dim'], MEANS))
     if _distributed:
         sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        data_loader = data.DataLoader(dataset, args.batch_size,
-                                    num_workers=args.num_workers,
-                                    shuffle=False, collate_fn=detection_collate,
-                                    pin_memory=True, sampler=sampler)
+        data_loader = torch.utils.data.DataLoader(dataset)
     else:
-        data_loader = data.DataLoader(dataset, args.batch_size,
-                            num_workers=args.num_workers,
-                            shuffle=True, collate_fn=detection_collate,
-                            pin_memory=True)
+        data_loader = torch.utils.data.DataLoader(dataset)
     if not args.local_rank:
         print('Finished!')
-        print('Training SSD on:', dataset.name)
+        print('Training SSD on: COCO')
         print('Using the specified args:')
         print(args)
 
@@ -152,7 +191,7 @@ def train():
         loss = train_one_epoch(data_loader, getloss, optimizer, iteration)
         adjust_learning_rate.step()
         if not (iteration-args.start_iter) == 0 and iteration % args.save_every_n_epochs == 0:
-            torch.distributed.barrier()
+            #torch.distributed.barrier()
             if not args.local_rank:
                 print('Saving state, iter:', iteration)
                 torch.save(vgg_.state_dict() if 'teacher' in target else mobilenetv2_.state_dict(),
